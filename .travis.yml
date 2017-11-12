@@ -1,15 +1,36 @@
-language: python
+sudo: required
 
+services:
+- docker
+
+language: python
 python:
-  - "3.5"
+- '3.5'
 
 before_install:
-  # Add bats test framework
-  - sudo add-apt-repository ppa:duggan/bats --yes
-  - sudo apt-get update -qq
-  - sudo apt-get install -qq bats
+- sudo add-apt-repository ppa:duggan/bats --yes
+- sudo apt-get update -qq
+- sudo apt-get install -qq bats
 
-install: "pip install -r requirements.txt"
+install:
+- make install
 
 script:
-    - bats test.sh
+- bats test.sh
+- make test
+
+before_deploy:
+- docker login -u $DOCKER_USER -p $DOCKER_PASS
+
+deploy:
+- provider: script
+  script: make push
+  on:
+    branch: master
+    tags: true
+
+env:
+  global:
+  - secure: KoEv1mpaF063lz2hk/VatqBRiHjkET46FciARYXrUKjRLANO4INexFivKNPRdF5oQzya3ZBR8Ff0WBU3tLOHPVr4xZsDFV/osSh0os1/wWWNs+AZw1Zzl9NyL4B/ULkqujJS7wDRvn+SEKqiF/8k+CcDyGJowXwPzCSGhpQd4wjPyvUsfULdqjjAerxqfwRBnvvuAG4cqy2JQkkTbfCtQvDbD4WdsJ+g2MRc3KNBT05V4SFjeiuAgbZdQpt5rjum4x7B52DnmXwT/AcySeAN4p6DxY2Ggk+KHf9IMEFjIYrrBo/3j2eA5KidkHVnnUcV6ilNZeOX9YeI9prKqN/L0MGMKqA1Ykax74b8/eZEkX7nlHaCf/LvmgdfVb47cCZQiXhuwmC9NAqB9s28ACZIu01AS6V0tS58aB8hWI6eOByEcdRYMJSwTWnF3n87Bi42uV8jrsX5pu6e5dvEU75jDWA8hB8AeOVe5h/73sRo5HFEmB3S3+xKJEBVgCoZ12G2rlM/O9xqsU8QIiB0mCyyRjh6V0BNxDrvBGJvKltxXO2zCw0HCDL9RjKhiem4YWs8veQiZJ0Fch2Mt2PAYcWbXr6oi/4S8GaWi/sLpE8HvJbIIBPIXwJS9Mj3NUbw+STL4VRlKsyKJg/pxt0NGUiTIjSWNNGvijBJhLJnKD2zMyQ=
+  - secure: Wr1dXI+DYsUFjnJqfLJs+latlkFGiJOfGAFXu5FNMC1dx1bkg/yiNqZBwr2ybmvRNselaG0dnVeyCQTascSRGroIeSSbixxodx1PwRxYvPFKqhni9fci9opSmPrksYhWfKKL0QStqQddc02vujsCYhbYkoPL9yq5HMo04ESrmZmr7AAJNo+pmIQgn8DxKd0WybA90O4c9+dZORVcACO5YtmhbIpDjCUo3oCChp992sE91D2NOAdOz8UldNcxhozk9xLxFBWX6HWH3Qy8mGRzu2ZuXKxbl1wmk/ObtOpWFAw5k+/3LssHLxSrQiIGRlZ7L48aSB2YgGfyCROO0/NVOzevnkXa/Mw6GVguaEuJQNppoaSFhL2EQIi8Py+oWXDRzPXcET4gCC7rXwpmzqrW2J3GZzMSfbSpeAlJAB/gPpkMR5KmjSf4a5/qnjibRDbKpA5ZljGJ3kHThxXN0Wi9C+Bh4H4vuYE1xIGnSPXuzdZyWdNzAmKeyWK0qxRKPc/Bd7I2Mb+aHHSPxEfDalmiPSUlJ3GElrs2CszJjtG1eQ9CNEQmy5wmvE8PBr3sU3ttexDRk+gGhDv6/FJU1ErdkUKIoAVP4ts3RYaxv8MBalPnSSknj6rPLU/EGZYFlYZUWrdzoF4rT/fgxqxeO6Os2IKAGlPf2NUOeOGKTIF34dQ=
+

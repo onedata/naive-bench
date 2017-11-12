@@ -1,6 +1,10 @@
 # naive-bench
 
-[![Build Status](https://api.travis-ci.org/bkryza/naive-bench.svg?branch=master)](https://travis-ci.org/bkryza/naive-bench)
+[![Latest Release](http://github-release-version.herokuapp.com/github/onedata/naive-bench/release.svg)](https://github.com/onedata/naive-bench/releases/latest)
+[![Build Status](https://travis-ci.org/onedata/naive-bench.svg?branch=master)](https://travis-ci.org/onedata/naive-bench)
+[![Codacy Badge](https://api.codacy.com/project/badge/Grade/b008f8665fed427291a26d25c2fc9433)](https://www.codacy.com/app/groundnuty/naive-bench_2?utm_source=github.com&amp;utm_medium=referral&amp;utm_content=onedata/naive-bench&amp;utm_campaign=Badge_Grade)
+[![Latest Docker Tag](https://images.microbadger.com/badges/image/onedata/naive-bench.svg)](https://microbadger.com/images/onedata/naive-bench "Get your own image badge on microbadger.com")
+[![Latest Docker Tag Details](https://images.microbadger.com/badges/version/onedata/naive-bench.svg)](https://microbadger.com/images/onedata/naive-bench "Get your own version badge on microbadger.com")
 
 Simple filesystem performance benchmark, creates X files of size Y, overwrites their content, performs linear read of all files, performs random read (using seek) of all files and finally removes all files.
 
