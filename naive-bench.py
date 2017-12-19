@@ -28,12 +28,19 @@
 import random, time, optparse, humanize
 import socket, sys, os, re, math, hashlib
 import functools, string
+import shutil
+import influxdb
+from aiographite.protocol import PlaintextProtocol
+from aiographite import connect
+import time
+import asyncio
+
 
 from os import system
 from functools import partial
 from itertools import repeat
-from multiprocessing import Pool, freeze_support, Lock, Process, Manager
-
+from multiprocessing import Pool, freeze_support, Lock, Process, Manager, Queue, Value
+import queue
 #
 # Global constants
 #
@@ -41,27 +48,138 @@ kibybytes = ['KiB', 'MiB', 'GiB', 'TiB', 'PiB', 'EiB']
 kilobytes = ['KB', 'MB', 'GB', 'TB', 'PB', 'EB']
 
 process_manager = Manager()
-
+influxdbClient = None
 
 #
 # Initialize CSV column labels
 #
 storage_name_label = "STORAGE NAME"
+total_time_label = "TOTAL TIME [s]"
+global_start_time_label = "START TIME [s]"
+global_end_time_label = "END TIME [s]"
 number_files_label = "FILE COUNT"
 average_file_size_label = "AVERAGE FILE SIZE [b]"
 create_files_label = "CREATE TIME [s]"
 create_files_size_label = "CREATE SIZE [b]"
+create_files_throughput_label = "CREATE THROUGHPUT [b/s]"
 overwrite_files_label = "WRITE TIME [s]"
 overwrite_files_size_label = "WRITE SIZE [b]"
+overwrite_files_throughput_label = "WRITE THROUGHPUT [b/s]"
 linear_read_label = "LINEAR READ TIME [s]"
 linear_read_size_label = "LINEAR READ SIZE [b]"
+linear_read_throughput_label = "LINEAR READ THROUGHPUT [b/s]"
 random_read_label = "RANDOM READ TIME [s]"
 random_read_size_label = "RANDOM READ SIZE [b]"
+random_read_throughput_label = "RANDOM READ THROUGHPUT [b/s]"
 delete_label = "DELETE"
 
 __test_data_dir = "naive-bench-data"
 
+def init_influxdb(host,port,user,password,database):
+    client = influxdb.InfluxDBClient(host, port, user, password, database)
+    client.create_database(database)
+    return client
 
+def write_progress_to_grafite(client, measurement, tags, measurement_time, fields):
+    """
+    Get randomized file size based on average 'filesize' and deviation range.
+    """
+    json_body = [
+        {
+            "measurement": measurement,
+            "tags": tags,
+            "fields": fields
+        }
+    ]
+    retry_count = 20
+    for i in range(0,retry_count):
+        try:
+          client.write_points(json_body,time_precision="u")
+          #print(json_body,file=sys.stderr)
+          break
+        except influxdb.exceptions.InfluxDBClientError as exp:
+          print(str(exp),file=sys.stderr)
+          print(json_body,file=sys.stderr)
+          print("Trying {}/{}".format(i,retry_count,file=sys.stderr))
+          client.write_points(json_body,time_precision="u")
+
+def write_progress_to_influxdb(client, measurement, tags, measurement_time, fields):
+    """
+    Get randomized file size based on average 'filesize' and deviation range.
+    """
+    json_body = [
+        {
+            "measurement": measurement,
+            "tags": tags,
+            "fields": fields
+        }
+    ]
+    retry_count = 20
+    for i in range(0,retry_count):
+        try:
+          client.write_points(json_body,time_precision="u")
+          #print(json_body,file=sys.stderr)
+          break
+        except influxdb.exceptions.InfluxDBClientError as exp:
+          print(str(exp),file=sys.stderr)
+          print(json_body,file=sys.stderr)
+          print("Trying {}/{}".format(i,retry_count,file=sys.stderr))
+          client.write_points(json_body,time_precision="u")
+
+def prepare_progress_data_for_influx(i,influxdbClient, time, extra_tags, threads_progress_data):
+    if influxdbClient is not None:
+        tags = { "thread": str(i) }
+        fields = {
+            "throughput": float(threads_progress_data["throughput"]),
+            "total_processed_bytes": float(threads_progress_data["total_processed_bytes"]),
+            "total_size_to_process": float(threads_progress_data["total_size_to_process"])
+        }
+        tags.update(extra_tags)
+        write_progress_to_influxdb(
+            influxdbClient,
+            "rt." + threads_progress_data["measurment"],
+            tags, time, fields)
+
+def prepare_result_data_for_influx(influxdbClient, time, extra_tags, storage_name, \
+                                   total_time, global_start_time, global_end_time, \
+                                   filecount, filesize, create_files_time, \
+                                   create_files_bytes_size, overwrite_files_time, \
+                                   overwrite_files_bytes_size, linear_read_time, \
+                                   linear_read_bytes_size, random_read_time, \
+                                   random_read_bytes_size, delete_time, \
+                                   create_files_throughput, overwrite_files_throughput, \
+                                   linear_read_throughput, random_read_throughput):
+
+    tags = { "storage_name": storage_name }
+    fields = {
+        "total_time": float(total_time),
+        "global_start_time": float(global_start_time),
+        "global_end_time": float(global_end_time),
+        "filecount": float(filecount),
+        "filesize": float(filesize),
+        "create_files_time": float(create_files_time),
+        "create_files_bytes_size": float(create_files_bytes_size),
+        "create_files_throughput": float(create_files_throughput),
+        "overwrite_files_time": float(overwrite_files_time),
+        "overwrite_files_bytes_size": float(overwrite_files_bytes_size),
+        "overwrite_files_throughput": float(overwrite_files_throughput),
+        "linear_read_time": float(linear_read_time),
+        "linear_read_bytes_size": float(linear_read_bytes_size),
+        "linear_read_throughput": float(linear_read_throughput),
+        "random_read_time": float(random_read_time),
+        "random_read_bytes_size": float(random_read_bytes_size),
+        "random_read_throughput": float(random_read_throughput),
+        "delete_time": float(delete_time)
+    }
+    # Replace all nan values wtih 0
+    for key in fields:
+        if math.isnan(fields[key]):fields[key]=float(0)
+
+    tags.update(extra_tags)
+    write_progress_to_influxdb(
+        influxdbClient,
+        "results.all",
+        tags, time, fields)
 
 def get_random_file_size(filesize, dev):
     """
@@ -125,17 +243,49 @@ def drop_caches():
     Drops file cache
     """
 
+    if shutil.which("sudo") is not None:
+        sh = "sudo sh"
+    else:
+        sh = "sh"
+
     cmd = ""
     if sys.platform == "linux" or sys.platform == "linux2":
-        cmd = "sudo sh -c 'sync ; echo 3 > /proc/sys/vm/drop_caches'"
+        cmd = sh + " -c 'sync ; echo 3 > /proc/sys/vm/drop_caches'"
     elif sys.platform == "darwin":
-        cmd = "sudo sh -c 'sync; purge'"
+        cmd = sh + " -c 'sync; purge'"
     else:
         print ( sys.platform, " platform is not supported - exiting." )
         sys.exit(1)
 
     system(cmd)
 
+def send_progress_data(data_queue,influxdbClient,benchmark_active,extra_tags):
+    measurment_timestamp = float(0)
+    while benchmark_active.value:
+        threads_progress_data = []
+        for data in data_queue:
+            try:
+                threads_progress_data.append(data.get(True,0.5))
+            except queue.Empty:
+                continue
+        if len(threads_progress_data)  > 0:
+            data_sum = {
+                "measurment": "",
+                "total_processed_bytes": 0.0,
+                "total_size_to_process": 0.0,
+                "throughput": 0.0
+            }
+            for data in threads_progress_data:
+                if data_sum["measurment"] != "" and data_sum["measurment"] != data[1]["measurment"]:
+                    raise NameError(data_sum["measurment"] + "!=" + data[1]["measurment"])
+                data_sum["measurment"] = data[1]["measurment"]
+                data_sum["total_processed_bytes"] += data[1]["total_processed_bytes"]
+                data_sum["total_size_to_process"] += data[1]["total_size_to_process"]
+                data_sum["throughput"] += data[1]["throughput"]
+
+            prepare_progress_data_for_influx(0,influxdbClient, \
+                                        measurment_timestamp,\
+                                        extra_tags, data_sum)
 
 def format_progress_message(name, progress, total, suffix, width=40, \
                             numtype='numeric'):
@@ -159,10 +309,21 @@ def format_progress_message(name, progress, total, suffix, width=40, \
             + " | " \
             + suffix + "        "
 
+def format_progress_data(measurment, progress, total, throughput):
+    """
+    Formats the progress data
+    """
+    return {
+        "measurment": measurment,
+        "total_processed_bytes": progress,
+        "total_size_to_process": total,
+        "throughput": throughput
+    }
 
 def run_benchmark(benchmark, \
                   filecount, threadcount, deviation, blocksize, \
-                  threads_results, threads_progress_messages):
+                  extra_tags, threads_results, threads_progress_messages, \
+                  threads_progress_data):
     """
     This is a generic function for running naive benchmarks
     """
@@ -189,7 +350,8 @@ def run_benchmark(benchmark, \
 
         benchmark_args.append(\
             (tidx, r, filesize, deviation, blocksize, __test_data_dir, \
-               threads_results, threads_progress_messages, start_barrier))
+               extra_tags, threads_results, threads_progress_messages, \
+               threads_progress_data[tidx], start_barrier))
         threads_results[tidx] = 0
         threads_progress_messages[tidx] = "Starting task "+str(tidx)
 
@@ -199,7 +361,7 @@ def run_benchmark(benchmark, \
     progress_bars = []
     for i in range(threadcount):
         child = Process(target=benchmark, \
-                        args=benchmark_args[i])
+                        args=benchmark_args[i],)
         child.start()
         threads.append(child)
 
@@ -216,11 +378,13 @@ def run_benchmark(benchmark, \
     time.sleep(0.5)
     while any(thread.is_alive() for thread in threads):
         time.sleep(0.5)
+        measurment_timestamp = time.time()
         for i in range(threadcount):
             print(threads_progress_messages[i], file=sys.stderr)
         for i in range(threadcount):
             sys.stderr.write("\x1b[A")
 
+    measurment_timestamp = time.time()
     for i in range(threadcount):
         print(threads_progress_messages[i], file=sys.stderr)
 
@@ -230,12 +394,14 @@ def run_benchmark(benchmark, \
 
 
 def file_create_benchmark(task_id, file_ids, filesize, deviation, \
-                          blocksize, test_data_dir, \
+                          blocksize, test_data_dir, extra_tags, \
                           thread_results, thread_progress_messages, \
-                          start_barrier):
+                          thread_progress_data, start_barrier):
     """
     Task which creates a set of test files and measures total time
     """
+
+    _measurment = "create"
 
     total_written_bytes = 0
 
@@ -256,7 +422,7 @@ def file_create_benchmark(task_id, file_ids, filesize, deviation, \
     randdata = get_random_data(blocksize)
 
     start_barrier.wait()
-    start_time = time.time()
+    start_time = time.time()    
     for i in range(len(file_ids)):
         #
         # Create random size file
@@ -271,12 +437,12 @@ def file_create_benchmark(task_id, file_ids, filesize, deviation, \
             block_written_bytes = outfile.write(randdata)
             file_written_bytes += block_written_bytes
             total_written_bytes += block_written_bytes
+            throughput = total_written_bytes/(time.time()-start_time)
+
             #
             # Format progress message
             #
-            create_current_throughput = \
-                humanize.naturalsize(total_written_bytes/(time.time()-start_time)) \
-                + "/s"
+            create_current_throughput = humanize.naturalsize(throughput) + "/s"
 
             thread_progress_messages[task_id] = \
                 format_progress_message("Task #" + str(task_id),
@@ -284,6 +450,10 @@ def file_create_benchmark(task_id, file_ids, filesize, deviation, \
                                         total_size_to_write,
                                         create_current_throughput,
                                         width=40, numtype='filesize')
+            thread_progress_data.put([task_id, \
+                format_progress_data(_measurment,total_written_bytes,
+                                    total_size_to_write,
+                                    throughput)])
 
         #
         # Write remainder of the file
@@ -300,9 +470,8 @@ def file_create_benchmark(task_id, file_ids, filesize, deviation, \
 
     end_time = time.time() - start_time
 
-    current_throughput = \
-        humanize.naturalsize(total_written_bytes/(time.time()-start_time)) \
-        + "/s"
+    throughput = total_written_bytes/(time.time()-start_time)
+    current_throughput = humanize.naturalsize(throughput) + "/s"
 
     thread_progress_messages[task_id] = \
         format_progress_message("Task #" + str(task_id),
@@ -310,18 +479,22 @@ def file_create_benchmark(task_id, file_ids, filesize, deviation, \
                                 total_size_to_write,
                                 current_throughput,
                                 width=40, numtype='filesize')
+    thread_progress_data.put([task_id, \
+        format_progress_data(_measurment,total_written_bytes,
+                            total_size_to_write,
+                            throughput)])
 
     thread_results[task_id] = (total_written_bytes, end_time)
 
-
-
 def file_write_benchmark(task_id, file_ids, filesize, deviation, \
-                          blocksize, test_data_dir, \
+                          blocksize, test_data_dir, extra_tags, \
                           thread_results, thread_progress_messages, \
-                          start_barrier):
+                          thread_progress_data,start_barrier):
     """
     Benchmark testing writing to existing files
     """
+
+    _measurment = "write"
 
     total_written_bytes = 0
 
@@ -338,7 +511,6 @@ def file_write_benchmark(task_id, file_ids, filesize, deviation, \
                                 total_size_to_write,
                                 "???",
                                 width=40, numtype='filesize')
-
 
     randdata = get_random_data(blocksize)
 
@@ -358,11 +530,13 @@ def file_write_benchmark(task_id, file_ids, filesize, deviation, \
             block_written_bytes = outfile.write(randdata)
             file_written_bytes += block_written_bytes
             total_written_bytes += block_written_bytes
+            throughput = total_written_bytes/(time.time()-start_time)
+
             #
             # Format progress message
             #
             create_current_throughput = \
-                humanize.naturalsize(total_written_bytes/(time.time()-start_time)) \
+                humanize.naturalsize(throughput) \
                 + "/s"
 
             thread_progress_messages[task_id] = \
@@ -371,6 +545,10 @@ def file_write_benchmark(task_id, file_ids, filesize, deviation, \
                                         total_size_to_write,
                                         create_current_throughput,
                                         width=40, numtype='filesize')
+            thread_progress_data.put([task_id, \
+                format_progress_data(_measurment,total_written_bytes,
+                                    total_size_to_write,
+                                    throughput)])
 
         #
         # Write remainder of the file
@@ -381,8 +559,9 @@ def file_write_benchmark(task_id, file_ids, filesize, deviation, \
 
     end_time = time.time() - start_time
 
+    throughput = total_written_bytes/(time.time()-start_time)
     current_throughput = \
-        humanize.naturalsize(total_written_bytes/(time.time()-start_time)) \
+        humanize.naturalsize(throughput) \
         + "/s"
 
     thread_progress_messages[task_id] = \
@@ -390,18 +569,24 @@ def file_write_benchmark(task_id, file_ids, filesize, deviation, \
                                 total_written_bytes,
                                 total_size_to_write,
                                 current_throughput,
-                                width=40, numtype='filesize')
+                                width=40, numtype='filesize')   
+    thread_progress_data.put([task_id, \
+        format_progress_data(_measurment,total_written_bytes,
+                            total_size_to_write,
+                            throughput)])
 
     thread_results[task_id] = (total_written_bytes, end_time)
 
 
 def file_random_write_benchmark(task_id, file_ids, filesize, deviation, \
-                          blocksize, test_data_dir, \
+                          blocksize, test_data_dir, extra_tags, \
                           thread_results, thread_progress_messages, \
-                          start_barrier):
+                          thread_progress_data, start_barrier):
     """
     Benchmark testing writing to existing files
     """
+
+    _measurment = "random_write"
 
     total_written_bytes = 0
 
@@ -418,7 +603,6 @@ def file_random_write_benchmark(task_id, file_ids, filesize, deviation, \
                                 total_size_to_write,
                                 "???",
                                 width=40, numtype='filesize')
-
 
     randdata = get_random_data(blocksize)
 
@@ -442,12 +626,13 @@ def file_random_write_benchmark(task_id, file_ids, filesize, deviation, \
             block_written_bytes = outfile.write(randdata)
             file_written_bytes += block_written_bytes
             total_written_bytes += block_written_bytes
+            throughput = total_written_bytes/(time.time()-start_time)
 
             #
             # Format progress message
             #
             create_current_throughput = \
-                humanize.naturalsize(total_written_bytes/(time.time()-start_time)) \
+                humanize.naturalsize(throughput) \
                 + "/s"
 
             thread_progress_messages[task_id] = \
@@ -456,6 +641,10 @@ def file_random_write_benchmark(task_id, file_ids, filesize, deviation, \
                                         total_size_to_write,
                                         create_current_throughput,
                                         width=40, numtype='filesize')
+            thread_progress_data.put([task_id, \
+                format_progress_data(_measurment,total_written_bytes,
+                                    total_size_to_write,
+                                    throughput)])
 
         #
         # Write remainder of the file
@@ -466,8 +655,9 @@ def file_random_write_benchmark(task_id, file_ids, filesize, deviation, \
 
     end_time = time.time() - start_time
 
+    throughput = total_written_bytes/(time.time()-start_time)
     current_throughput = \
-        humanize.naturalsize(total_written_bytes/(time.time()-start_time)) \
+        humanize.naturalsize(throughput) \
         + "/s"
 
     thread_progress_messages[task_id] = \
@@ -476,17 +666,22 @@ def file_random_write_benchmark(task_id, file_ids, filesize, deviation, \
                                 total_size_to_write,
                                 current_throughput,
                                 width=40, numtype='filesize')
+    thread_progress_data.put([task_id, \
+        format_progress_data(_measurment,total_written_bytes,
+                            total_size_to_write,
+                            throughput)])
 
     thread_results[task_id] = (total_written_bytes, end_time)
 
 
 def file_linear_read_benchmark(task_id, file_ids, filesize, deviation, \
-                               blocksize, test_data_dir, \
+                               blocksize, test_data_dir, extra_tags, \
                                thread_results, thread_progress_messages, \
-                               start_barrier):
+                               thread_progress_data, start_barrier):
     """
     Benchmark testing the time of linear reading from files 
     """
+    _measurment = "linear_read"
 
     total_read_bytes = 0
 
@@ -505,7 +700,9 @@ def file_linear_read_benchmark(task_id, file_ids, filesize, deviation, \
                                 total_size_to_read,
                                 "???",
                                 width=40, numtype='filesize')
-
+    # thread_progress_data.put([task_id, \
+    #     format_progress_data(_measurment,total_read_bytes,
+    #                         total_size_to_read, 0)])
 
     outfile = open("/dev/null", "wb")
     start_barrier.wait()
@@ -526,11 +723,13 @@ def file_linear_read_benchmark(task_id, file_ids, filesize, deviation, \
             block_read_bytes = outfile.write(infile.read(blocksize))
             file_read_bytes += block_read_bytes
             total_read_bytes += block_read_bytes
+            throughput = total_read_bytes/(time.time()-start_time)
+
             #
             # Format progress message
             #
             current_throughput = \
-                humanize.naturalsize(total_read_bytes/(time.time()-start_time)) \
+                humanize.naturalsize(throughput) \
                 + "/s"
 
             thread_progress_messages[task_id] = \
@@ -539,6 +738,10 @@ def file_linear_read_benchmark(task_id, file_ids, filesize, deviation, \
                                         total_size_to_read,
                                         current_throughput,
                                         width=40, numtype='filesize')
+            thread_progress_data.put([task_id, \
+                format_progress_data(_measurment,total_read_bytes,
+                                    total_size_to_read,
+                                    throughput)])
 
         #
         # Write remainder of the file
@@ -549,8 +752,10 @@ def file_linear_read_benchmark(task_id, file_ids, filesize, deviation, \
 
     outfile.close()
     end_time = time.time() - start_time
+
+    throughput = total_read_bytes/(time.time()-start_time)
     current_throughput = \
-        humanize.naturalsize(total_read_bytes/(time.time()-start_time)) \
+        humanize.naturalsize(throughput) \
         + "/s"
 
     thread_progress_messages[task_id] = \
@@ -559,16 +764,22 @@ def file_linear_read_benchmark(task_id, file_ids, filesize, deviation, \
                                 total_size_to_read,
                                 current_throughput,
                                 width=40, numtype='filesize')
+    thread_progress_data.put([task_id, \
+        format_progress_data(_measurment,total_read_bytes,
+                            total_size_to_read,
+                            throughput)])
+
     thread_results[task_id] = (total_read_bytes, end_time)
 
 
 def file_random_read_benchmark(task_id, file_ids, filesize, deviation, \
-                               blocksize, test_data_dir, \
+                               blocksize, test_data_dir, extra_tags, \
                                thread_results, thread_progress_messages, \
-                               start_barrier):
+                               thread_progress_data, start_barrier):
     """
     Benchmark measures the time of random read from files using seek
     """
+    _measurment = "random_read"
 
     total_read_bytes = 0
 
@@ -616,11 +827,13 @@ def file_random_read_benchmark(task_id, file_ids, filesize, deviation, \
             block_read_bytes = outfile.write(infile.read(blocksize))
             file_read_bytes += block_read_bytes
             total_read_bytes += block_read_bytes
+            throughput = total_read_bytes/(time.time()-start_time)
+        
             #
             # Format progress message
             #
             current_throughput = \
-                humanize.naturalsize(total_read_bytes/(time.time()-start_time)) \
+                humanize.naturalsize(throughput) \
                 + "/s"
 
             thread_progress_messages[task_id] = \
@@ -629,6 +842,10 @@ def file_random_read_benchmark(task_id, file_ids, filesize, deviation, \
                                         total_size_to_read,
                                         current_throughput,
                                         width=40, numtype='filesize')
+            thread_progress_data.put([task_id, \
+                format_progress_data(_measurment,total_read_bytes,
+                                    total_size_to_read,
+                                    throughput)])
 
         #
         # Write remainder of the file
@@ -639,8 +856,10 @@ def file_random_read_benchmark(task_id, file_ids, filesize, deviation, \
 
     outfile.close()
     end_time = time.time() - start_time
+
+    throughput = total_read_bytes/(time.time()-start_time)
     current_throughput = \
-        humanize.naturalsize(total_read_bytes/(time.time()-start_time)) \
+        humanize.naturalsize(throughput) \
         + "/s"
     thread_progress_messages[task_id] = \
         format_progress_message("Task #" + str(task_id),
@@ -648,6 +867,10 @@ def file_random_read_benchmark(task_id, file_ids, filesize, deviation, \
                                 total_size_to_read,
                                 current_throughput,
                                 width=40, numtype='filesize')
+    thread_progress_data.put([task_id, \
+        format_progress_data(_measurment,total_read_bytes,
+                            total_size_to_read,
+                            throughput)])
     thread_results[task_id] = (total_read_bytes, end_time)
 
 
@@ -680,6 +903,10 @@ Defaults to hostname.""",
     parser.add_option('-c', '--csv',
         action="store_true", dest="csv",
         help="Generate CSV output.", default=False)
+
+    parser.add_option('-A', '--add-columns', dest="add_columns",
+        help="""Add custom columns with values between first (storage name) and the rest of the columns
+Eg. -A "TIME=$(date +"%Y%m%d_%H%M%S"),TEST=mytest""", default="")
 
     parser.add_option('-H', '--no-header',
         action="store_true", dest="skipheader",
@@ -729,6 +956,31 @@ size is too small.""",
         help="""If specified, disables cache clearing between steps.""",
         default=False)
 
+    parser.add_option('--influxdb-user',
+        action="store", dest="influxdb_user",
+        help="""Influxdb user""",
+        default="admin")
+
+    parser.add_option('--influxdb-password',
+        action="store", dest="influxdb_password",
+        help="""Influxdb password""",
+        default="password")
+
+    parser.add_option('--influxdb-host',
+        action="store", dest="influxdb_host",
+        help="""Influxdb host""",
+        default=None)
+
+    parser.add_option('--influxdb-port',
+        action="store", dest="influxdb_port",
+        help="""Influxdb password""",
+        default="8086")
+
+    parser.add_option('--influxdb-database',
+        action="store", dest="influxdb_database",
+        help="""Influxdb host""",
+        default="naive-bench-1")
+
     #
     # Parse the command line
     #
@@ -740,6 +992,13 @@ size is too small.""",
     deviation = options.deviation
     threadcount = options.threadcount
     dropcaches = not options.nopurge
+    add_columns = list(map(lambda x: x.split('='), options.add_columns.split(',')))
+
+    influxdb_user = options.influxdb_user
+    influxdb_password = options.influxdb_password
+    influxdb_host = options.influxdb_host
+    influxdb_port = options.influxdb_port
+    influxdb_database = options.influxdb_database
 
     if math.isnan(filesize):
         print("Invalid filesize - exiting.", file=sys.stderr)
@@ -843,21 +1102,49 @@ size is too small.""",
         drop_caches()
         print(" DONE", file=sys.stderr)
 
+    #
+    # Create connection to influxdb and parse extra tags
+    # that will be incluced with each data point
+    #
+    benchmark_active = Value('b', True)
+    extra_tags = {}
+    if influxdb_host is not None:
+        influxdbClient = init_influxdb(influxdb_host, influxdb_port, \
+                                      influxdb_user, influxdb_password, \
+                                      influxdb_database)
+        if not options.add_columns == "" :
+            for tag in add_columns: extra_tags[tag[0]]=tag[1] 
+
+
+
+
     ##########
     #
     # Start file creation benchmark
     #
     #
+    global_start_time=time.time()
+
     if not options.readonly:
         threads = []
         threads_results = process_manager.dict()
         threads_progress_messages = process_manager.dict()
         print("\n--- INITIALIZING FILE CREATION BENCHMARK...\n", file=sys.stderr)
         
+        #
+        # Setup process for sending data to influxdb
+        #
+        threads_progress_data = [ Queue() for i in range(0,threadcount) ]
+        influxdbSender = Process(target=send_progress_data, \
+                                args=(threads_progress_data, \
+                                    influxdbClient, benchmark_active, \
+                                    extra_tags))
+        influxdbSender.start()
         create_files_time = run_benchmark(file_create_benchmark, \
                                         filecount, threadcount, deviation, \
-                                        blocksize, threads_results, \
-                                        threads_progress_messages)
+                                        blocksize, extra_tags, threads_results, \
+                                        threads_progress_messages, \
+                                        threads_progress_data)
 
         #
         # Calculate total benchmark size and time
@@ -868,8 +1155,9 @@ size is too small.""",
         print("--- CREATED " + str(filecount) + " FILES OF TOTAL SIZE " \
             + str(humanize.naturalsize(create_files_bytes_size)) + " IN " \
             + str(create_files_time) + "s", file=sys.stderr)
+        create_files_throughput = create_files_bytes_size/create_files_time
         print("--- THROUGHPUT: " \
-            + str(humanize.naturalsize(create_files_bytes_size/create_files_time))\
+            + str(humanize.naturalsize(create_files_throughput))\
             + "/s", file=sys.stderr)
         print("", file=sys.stderr)
 
@@ -886,12 +1174,22 @@ size is too small.""",
         threads = []
         threads_results = process_manager.dict()
         threads_progress_messages = process_manager.dict()
+        #
+        # Setup process for sending data to influxdb
+        #
+        threads_progress_data = [ Queue() for i in range(0,threadcount) ]
+        influxdbSender = Process(target=send_progress_data, \
+                                args=(threads_progress_data, \
+                                    influxdbClient, benchmark_active, \
+                                    extra_tags))
+        influxdbSender.start()
         print("\n--- INITIALIZING FILE RANDOM WRITE BENCHMARK...\n", file=sys.stderr)
         
         overwrite_files_time = run_benchmark(file_random_write_benchmark, \
                                             filecount, threadcount, deviation, \
-                                            blocksize, threads_results, \
-                                            threads_progress_messages)
+                                            blocksize, extra_tags, threads_results, \
+                                            threads_progress_messages, \
+                                            threads_progress_data)
 
         #
         # Calculate total benchmark size and time
@@ -902,9 +1200,9 @@ size is too small.""",
         print("--- WRITTE " + str(filecount) + " FILES WITH TOTAL SIZE" \
             + str(humanize.naturalsize(overwrite_files_bytes_size)) + " IN " \
             + str(overwrite_files_time) + "s", file=sys.stderr)
+        write_throughput = overwrite_files_bytes_size/overwrite_files_time
         print("--- THROUGHPUT: " \
-            + str(humanize.naturalsize(\
-                                overwrite_files_bytes_size/overwrite_files_time)) \
+            + str(humanize.naturalsize(write_throughput))
             + "/s", file=sys.stderr)
         print("", file=sys.stderr)
         
@@ -921,12 +1219,22 @@ size is too small.""",
         threads = []
         threads_results = process_manager.dict()
         threads_progress_messages = process_manager.dict()
+        #
+        # Setup process for sending data to influxdb
+        #
+        threads_progress_data = [ Queue() for i in range(0,threadcount) ]
+        influxdbSender = Process(target=send_progress_data, \
+                                args=(threads_progress_data, \
+                                    influxdbClient, benchmark_active, \
+                                    extra_tags))
+        influxdbSender.start()
         print("\n--- INITIALIZING FILE WRITE BENCHMARK...\n", file=sys.stderr)
         
         overwrite_files_time = run_benchmark(file_write_benchmark, \
                                             filecount, threadcount, deviation, \
-                                            blocksize, threads_results, \
-                                            threads_progress_messages)
+                                            blocksize, extra_tags, threads_results, \
+                                            threads_progress_messages, \
+                                            threads_progress_data)
 
         #
         # Calculate total benchmark size and time
@@ -937,9 +1245,9 @@ size is too small.""",
         print("--- OVERWRITTEN " + str(filecount) + " FILES WITH TOTAL SIZE" \
             + str(humanize.naturalsize(overwrite_files_bytes_size)) + " IN " \
             + str(overwrite_files_time) + "s", file=sys.stderr)
+        overwrite_files_throughput = overwrite_files_bytes_size/overwrite_files_time
         print("--- THROUGHPUT: " \
-            + str(humanize.naturalsize(\
-                                overwrite_files_bytes_size/overwrite_files_time)) \
+            + str(humanize.naturalsize(overwrite_files_throughput)) \
             + "/s", file=sys.stderr)
         print("", file=sys.stderr)
         
@@ -958,12 +1266,22 @@ size is too small.""",
         threads = []
         threads_results = process_manager.dict()
         threads_progress_messages = process_manager.dict()
+        #
+        # Setup process for sending data to influxdb
+        #
+        threads_progress_data = [ Queue() for i in range(0,threadcount) ]
+        influxdbSender = Process(target=send_progress_data, \
+                                args=(threads_progress_data, \
+                                    influxdbClient, benchmark_active, \
+                                    extra_tags))
+        influxdbSender.start()
         print("\n--- INITIALIZING FILE LINEAR READ BENCHMARK...\n", file=sys.stderr)
         
         linear_read_time = run_benchmark(file_linear_read_benchmark, \
                                              filecount, threadcount, deviation, \
-                                             blocksize, threads_results, \
-                                             threads_progress_messages)
+                                             blocksize, extra_tags, threads_results, \
+                                             threads_progress_messages, \
+                                             threads_progress_data)
 
         #
         # Calculate total benchmark size and time
@@ -974,8 +1292,9 @@ size is too small.""",
         print("--- READ " + str(filecount) + " FILES WITH TOTAL SIZE " \
               + str(humanize.naturalsize(linear_read_bytes_size)) + " IN " \
               + str(linear_read_time) + "s", file=sys.stderr)
+        linear_read_throughput = linear_read_bytes_size/linear_read_time
         print("--- THROUGHPUT: " \
-              + str(humanize.naturalsize(linear_read_bytes_size/linear_read_time)) \
+              + str(humanize.naturalsize(linear_read_throughput)) \
               + "/s", file=sys.stderr)
         print("", file=sys.stderr)
         
@@ -998,8 +1317,9 @@ size is too small.""",
         
         random_read_time = run_benchmark(file_random_read_benchmark, \
                                              filecount, threadcount, deviation, \
-                                             blocksize, threads_results, \
-                                             threads_progress_messages)
+                                             blocksize, extra_tags, threads_results, \
+                                             threads_progress_messages, \
+                                             threads_progress_data)
 
         #
         # Calculate total benchmark size and time
@@ -1010,6 +1330,7 @@ size is too small.""",
         print("--- READ " + str(filecount) + " FILES WITH TOTAL SIZE " \
               + str(humanize.naturalsize(random_read_bytes_size)) + " IN " \
               + str(random_read_time) + "s", file=sys.stderr)
+        random_read_throughput = random_read_bytes_size/random_read_time
         print("--- THROUGHPUT: " \
               + str(humanize.naturalsize(random_read_bytes_size/random_read_time)) \
               + "/s", file=sys.stderr)
@@ -1031,36 +1352,74 @@ size is too small.""",
         delete_time = time.time() - starttime
         print("DONE [%d s]"%(delete_time), file=sys.stderr)
 
+    global_end_time=time.time()
+
     print(file=sys.stderr)
     print(file=sys.stderr)
 
+    total_time = global_end_time - global_start_time
+
+    benchmark_active.value = False
     #
     # Print CSV on stdout
     #
     if options.csv:
         if not options.skipheader:
+            if options.add_columns != "":
+              print(';'.join(map(lambda x: x[0], add_columns))+';',end='')
+
             print(storage_name_label + ";" \
+                  + total_time_label + ";" \
+                  + global_start_time_label + ";" \
+                  + global_end_time_label + ";" \
                   + number_files_label + ";" \
                   + average_file_size_label + ";" \
                   + create_files_label + ";" \
                   + create_files_size_label + ";" \
+                  + create_files_throughput_label + ";" \
                   + overwrite_files_label + ";" \
                   + overwrite_files_size_label + ";"\
+                  + overwrite_files_throughput_label + ";"\
                   + linear_read_label + ";" \
                   + linear_read_size_label + ";"\
+                  + linear_read_throughput_label + ";"\
                   + random_read_label + ";" \
                   + random_read_size_label + ";"\
+                  + random_read_throughput_label + ";"\
                   + delete_label)
 
+        if options.add_columns !=  "":
+          print(';'.join(map(lambda x: x[1], add_columns))+';',end='')
+
         print(options.name + ";" \
+              + str(total_time) + ';' \
+              + str(global_start_time) + ';' \
+              + str(global_end_time) + ';' \
               + str(filecount) + ';' \
               + str(filesize) + ';' \
               + str(create_files_time) + ';' \
               + str(create_files_bytes_size) + ';' \
+              + str(create_files_throughput) + ';' \
               + str(overwrite_files_time) + ';' \
               + str(overwrite_files_bytes_size) + ';' \
+              + str(overwrite_files_throughput) + ';' \
               + str(linear_read_time) + ';' \
               + str(linear_read_bytes_size) + ';' \
+              + str(linear_read_throughput) + ';' \
               + str(random_read_time) + ';' \
               + str(random_read_bytes_size) + ';' \
+              + str(random_read_throughput) + ';' \
               + str(delete_time))
+
+    if influxdbClient is not None:
+        measurment_timestamp = time.time()
+        prepare_result_data_for_influx(influxdbClient, measurment_timestamp, \
+                                    extra_tags, options.name, \
+                                    total_time, global_start_time, global_end_time, \
+                                    filecount, filesize, create_files_time, \
+                                    create_files_bytes_size, overwrite_files_time, \
+                                    overwrite_files_bytes_size, linear_read_time, \
+                                    linear_read_bytes_size, random_read_time, \
+                                    random_read_bytes_size, delete_time, \
+                                    create_files_throughput, overwrite_files_throughput, \
+                                    linear_read_throughput, random_read_throughput)
